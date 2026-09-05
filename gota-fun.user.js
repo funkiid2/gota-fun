@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         gota fun v2
 // @namespace    http://tampermonkey.net/
-// @version      3.37.0
-// @description  v3.37.0: dos mejoras más de rendimiento. (1) _updateInGameState (v3.35.0) leía el.offsetParent en CADA tick del beautifier -- offsetParent fuerza un layout síncrono si hay algo invalidado pendiente, y eso corría igual cada 400-900ms en pleno juego sin que nada relacionado hubiera cambiado en casi todos esos ticks. Se saca del polling: ahora un MutationObserver puntual sobre 'style'/'class' de los 2 paneles del menú dispara _updateInGameState SOLO cuando de verdad cambian, nunca por temporizador. (2) #leaderboard-panel y el panel de Servidores (:has(> .server-table)) -- actualizan contenido seguido en partida (rankings, cupo de jugadores) pero no tenían ningún "contain" -- suman "contain: layout style" (sin "paint", tienen box-shadow/backdrop-filter propio que "paint" recortaría).
+// @version      3.35.0
+// @description  v3.35.0: las animaciones CSS continuas de los paneles del menú (nebulaMove en xp-meter/botones/nombre de servidor/portal-label, apexPortalAura, apexAvatarBreath) seguían corriendo aunque el jugador ya estuviera en partida y el menú estuviera fuera de vista -- una animación "infinite" no se detiene sola solo porque el elemento no se ve, salvo que quede en display:none real (no alcanza con opacity/visibility/estar tapado). Se agrega _updateInGameState, que revisa en cada tick de _scheduleBeautify (cada ~400ms, sin timer nuevo) si el panel de Funkiid Build/Perfil sigue realmente visible (offsetParent + getComputedStyle) y alterna una clase 'apex-in-game' en <html>; la hoja _apex_perf usa esa clase para pausar esas animaciones con animation-play-state (no cambia colores/posiciones, solo si siguen corriendo cuadro a cuadro) y las reactiva sola en cuanto el menú vuelve a ser visible.
 // @author       funkiid
 // @updateURL    https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
 // @downloadURL  https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
@@ -19,7 +19,7 @@
 (function () {
 'use strict';
 
-const SCRIPT_VERSION = '3.37.0';
+const SCRIPT_VERSION = '3.35.0';
 const DEBUG_FREEZE_LOG = false;
 const RETINA_PERF_MODE = false;
 if (RETINA_PERF_MODE) {
@@ -1468,7 +1468,6 @@ const _injectStyles = () => {
 
         canvas {
             transform: translateZ(0) !important;
-            will-change: transform !important;
         }
 
         .apex-timer-container, .apex-linesplit-fixed {
@@ -1486,19 +1485,6 @@ const _injectStyles = () => {
         }
         .main-panel img + *, .server-table td:first-child {
             contain: paint !important;
-        }
-
-        /* v3.37.0: #leaderboard-panel y el panel de Servidores
-           (:has(> .server-table)) actualizan su contenido seguido durante
-           una partida (rankings, cantidad de jugadores) pero no tenían
-           ningún "contain" -- a diferencia de .main-panel, que sí lo tiene
-           desde el principio. Se usa "layout style" (SIN "paint") porque
-           los dos tienen box-shadow/backdrop-filter propio -- "paint"
-           recortaría esa sombra a los límites exactos de la caja, cambiando
-           cómo se ven (mismo motivo por el que .apex-timer-container/
-           .apex-linesplit-fixed, más abajo, tampoco usan "paint"). */
-        #leaderboard-panel, :has(> .server-table) {
-            contain: layout style !important;
         }
 
         /* v3.35.0: pausa las animaciones "infinite" que viven DENTRO de los
@@ -1749,14 +1735,6 @@ const _tryAssembleMenuLayout = () => {
     if (profileOldParent && profileOldParent !== buildParent && profileOldParent !== wrapper && profileOldParent.children.length === 0) {
         profileOldParent.style.setProperty('display', 'none', 'important');
     }
-
-    // v3.37.0: recién acá quedan los 2 refs definitivos -- se engancha el
-    // observer puntual de visibilidad (ver _watchMenuVisibility más abajo en
-    // el archivo, section 20) y se corre un chequeo inicial una sola vez,
-    // en vez de depender del primer tick del polling que ya no existe.
-    _watchMenuVisibility(_apexBuildPanel);
-    _watchMenuVisibility(_apexProfilePanel);
-    _updateInGameState();
 };
 
 let _apexOptionsBtn = null, _apexHotkeysBtn = null, _apexThemeBtn = null, _apexCellPanelBtn = null;
@@ -1789,18 +1767,6 @@ const _tryAssembleExtraGrid = () => {
 // chequeo de getComputedStyle acá al lado. _apexBuildPanel/_apexProfilePanel
 // ya existen como refs (ver _tryAssembleMenuLayout más arriba) -- se reusan,
 // no hace falta un querySelector nuevo cada vez.
-// v3.37.0: _updateInGameState (v3.35.0) leía el.offsetParent en CADA tick de
-// _scheduleBeautifyLoop -- offsetParent fuerza un layout síncrono si hay
-// algo invalidado pendiente (uno de los ejemplos de libro de "layout
-// thrashing" evitables), y eso corría igual cada 900ms en plena partida sin
-// que nada relacionado con estos 2 paneles hubiera cambiado en casi todos
-// esos ticks. Se saca del polling: ahora un MutationObserver puntual mira
-// 'style' y 'class' de _apexBuildPanel/_apexProfilePanel -- son los únicos
-// 2 atributos por los que este mismo panel podría pasar a oculto/visible.
-// _updateInGameState solo se ejecuta cuando ESE observer ve un cambio real
-// en cualquiera de los dos, nunca por temporizador -- costo cero el resto
-// del tiempo, en vez de un layout forzado cada 400-900ms sin importar si
-// hacía falta.
 const _isMenuPanelVisible = (el) => {
     if (!el || !el.isConnected) return false;
     if (el.offsetParent === null) return false;
@@ -1809,6 +1775,9 @@ const _isMenuPanelVisible = (el) => {
 };
 let _apexInGame = false;
 const _updateInGameState = () => {
+    // Antes de tener los refs del menú (recién cargó la página) no se declara
+    // "en partida" -- eso dejaría las animaciones pausadas desde el arranque
+    // sin ninguna señal real de que el menú se ocultó.
     if (!_apexBuildPanel && !_apexProfilePanel) return;
     const menuVisible = _isMenuPanelVisible(_apexBuildPanel) || _isMenuPanelVisible(_apexProfilePanel);
     const nowInGame = !menuVisible;
@@ -1816,13 +1785,6 @@ const _updateInGameState = () => {
         _apexInGame = nowInGame;
         try { D.documentElement.classList.toggle('apex-in-game', _apexInGame); } catch (_) {}
     }
-};
-const _watchMenuVisibility = (el) => {
-    if (!el) return;
-    try {
-        new MutationObserver(_updateInGameState)
-            .observe(el, { attributes: true, attributeFilter: ['style', 'class'] });
-    } catch (_) {}
 };
 
 const _beautifyProcessTextNode = (node) => {
@@ -1992,6 +1954,8 @@ const _scheduleBeautify = () => {
     _beautifyTicks++;
     if (_tabHidden) return;
 
+    _updateInGameState();
+
     const _forcedSweep = _mutBacklogDropped;
 
     if (_beautifyTicks % _BEAUTIFY_PRUNE_EVERY_TICKS === 0) {
@@ -2008,23 +1972,7 @@ const _scheduleBeautify = () => {
         _runner();
     }
 };
-// v3.36.0: antes esto era un setInterval fijo a 400ms sin importar el
-// estado del juego. En partida (menú fuera de vista, _apexInGame true) la
-// única razón real para que este tick siga corriendo es el timer/badge de
-// line-split (arrow_range/refresh) -- no hace falta revisarlo cada 400ms
-// para eso. Se pasa a un loop autoreprogramable con setTimeout que elige su
-// propio próximo delay según _apexInGame: 400ms en el menú (responsividad
-// de la UI al armar el layout), 900ms en partida (menos despertares del
-// hilo principal mientras el juego está corriendo, sin perder el refresco
-// del badge de line-split -- ese timer visual no necesita más frecuencia
-// que eso para verse fluido).
-const _BEAUTIFY_TICK_MENU_MS = 400;
-const _BEAUTIFY_TICK_GAME_MS = 900;
-const _scheduleBeautifyLoop = () => {
-    _scheduleBeautify();
-    _oST_(_scheduleBeautifyLoop, _apexInGame ? _BEAUTIFY_TICK_GAME_MS : _BEAUTIFY_TICK_MENU_MS);
-};
-_scheduleBeautifyLoop();
+setInterval(_scheduleBeautify, 400);
 
 try {
     Object.defineProperty(W, '__GOTA_FUN__', {
