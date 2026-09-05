@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         gota fun v2
 // @namespace    http://tampermonkey.net/
-// @version      3.35.0
-// @description  v3.35.0: las animaciones CSS continuas de los paneles del menú (nebulaMove en xp-meter/botones/nombre de servidor/portal-label, apexPortalAura, apexAvatarBreath) seguían corriendo aunque el jugador ya estuviera en partida y el menú estuviera fuera de vista -- una animación "infinite" no se detiene sola solo porque el elemento no se ve, salvo que quede en display:none real (no alcanza con opacity/visibility/estar tapado). Se agrega _updateInGameState, que revisa en cada tick de _scheduleBeautify (cada ~400ms, sin timer nuevo) si el panel de Funkiid Build/Perfil sigue realmente visible (offsetParent + getComputedStyle) y alterna una clase 'apex-in-game' en <html>; la hoja _apex_perf usa esa clase para pausar esas animaciones con animation-play-state (no cambia colores/posiciones, solo si siguen corriendo cuadro a cuadro) y las reactiva sola en cuanto el menú vuelve a ser visible.
+// @version      3.36.0
+// @description  v3.36.0: performance.mark/measure/clearMarks/clearMeasures ya NO se anulan y getEntries/getEntriesByType/getEntriesByName ya no se fuerzan a devolver vacío -- el juego usa esas APIs para su contador de FPS nativo y anularlas de raíz lo dejaba mostrando "FPS: NaN". Ping/input siguen en el ceiling ya confirmado en sesiones previas (nada nuevo ahí sin datos de DEBUG_FREEZE_LOG).
 // @author       funkiid
 // @updateURL    https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
 // @downloadURL  https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
@@ -19,7 +19,7 @@
 (function () {
 'use strict';
 
-const SCRIPT_VERSION = '3.35.0';
+const SCRIPT_VERSION = '3.36.0';
 const DEBUG_FREEZE_LOG = false;
 const RETINA_PERF_MODE = false;
 if (RETINA_PERF_MODE) {
@@ -210,10 +210,14 @@ try { if (W.performance) W.performance.toJSON = function () { return {}; }; } ca
 
 if (!DEBUG_FREEZE_LOG) {
     try {
-        if (W.performance) {
-            W.performance.mark = NOP; W.performance.measure = NOP;
-            W.performance.clearMarks = NOP; W.performance.clearMeasures = NOP;
-        }
+        // v3.36.0: mark/measure YA NO se anulan -- el propio juego los usa
+        // para su contador de FPS nativo (crea un mark/measure de frame y lo
+        // lee con getEntriesByName), y anularlos de raíz dejaba "FPS: NaN"
+        // fijo en pantalla. La protección real contra analytics que leen
+        // timing viene de anular PerformanceObserver acá abajo (nadie puede
+        // *observar* esas entradas desde afuera) más el bloqueo de dominios
+        // de analytics ya existente -- no hacía falta duplicarlo rompiendo
+        // una función legítima del juego.
         W.PerformanceObserver = function () { return { observe: NOP, disconnect: NOP, takeRecords: () => [] }; };
         W.PerformanceObserver.supportedEntryTypes = [];
     } catch (_) {}
@@ -740,11 +744,12 @@ const _pSRTS = (performance.setResourceTimingBufferSize && performance.setResour
 const _pCM   = (performance.clearMarks    && performance.clearMarks.bind(performance))    || NOP;
 const _pCMs  = (performance.clearMeasures && performance.clearMeasures.bind(performance)) || NOP;
 try { _pSRTS(0); _pCRT(); } catch (_) {}
-try {
-    performance.getEntries       = () => EMPTY;
-    performance.getEntriesByType = () => EMPTY;
-    performance.getEntriesByName = () => EMPTY;
-} catch (_) {}
+// v3.36.0: getEntries/getEntriesByType/getEntriesByName YA NO se fuerzan a
+// devolver vacío -- era la otra mitad de la causa del "FPS: NaN" (el juego
+// lee getEntriesByName('frame'), y con esto siempre volvía [] -> duration
+// undefined -> NaN). El buffer de resource timing se sigue limpiando cada
+// 5s más abajo (_pCRT/_pSRTS/_pCM/_pCMs) para que no crezca sin límite --
+// eso no toca mark/measure.
 
 let _maintPend = false, _lastPerfMaint = 0, _lastStorageMaint = 0;
 const _schedMaint = () => {
@@ -1487,15 +1492,6 @@ const _injectStyles = () => {
             contain: paint !important;
         }
 
-        /* v3.35.0: pausa las animaciones "infinite" que viven DENTRO de los
-           paneles del menú principal en cuanto _updateInGameState detecta
-           que ese menú dejó de estar realmente visible (jugando en partida).
-           animation-play-state:paused congela el frame actual sin tocar
-           ningún color/posición -- en cuanto el menú vuelve a verse,
-           _updateInGameState saca la clase y las animaciones retoman solas
-           desde donde quedaron (con "infinite" no hay estado que perder).
-           No se pausa apexMenuIn (la entrada del panel, ya termina sola) ni
-           nada del loader de conexión (ese ya se autooculta por su cuenta). */
         html.apex-in-game .xp-meter > span,
         html.apex-in-game .xp-meter > span::before,
         html.apex-in-game .apex-portal-label,
@@ -1761,12 +1757,6 @@ const _tryAssembleExtraGrid = () => {
     });
 };
 
-// v3.35.0: "¿el menú principal está realmente visible ahora?" -- offsetParent
-// vuelve null cuando el elemento (o cualquier ancestro) tiene display:none,
-// pero NO cuando solo tiene opacity:0 o visibility:hidden, por eso se suma el
-// chequeo de getComputedStyle acá al lado. _apexBuildPanel/_apexProfilePanel
-// ya existen como refs (ver _tryAssembleMenuLayout más arriba) -- se reusan,
-// no hace falta un querySelector nuevo cada vez.
 const _isMenuPanelVisible = (el) => {
     if (!el || !el.isConnected) return false;
     if (el.offsetParent === null) return false;
@@ -1775,9 +1765,6 @@ const _isMenuPanelVisible = (el) => {
 };
 let _apexInGame = false;
 const _updateInGameState = () => {
-    // Antes de tener los refs del menú (recién cargó la página) no se declara
-    // "en partida" -- eso dejaría las animaciones pausadas desde el arranque
-    // sin ninguna señal real de que el menú se ocultó.
     if (!_apexBuildPanel && !_apexProfilePanel) return;
     const menuVisible = _isMenuPanelVisible(_apexBuildPanel) || _isMenuPanelVisible(_apexProfilePanel);
     const nowInGame = !menuVisible;
