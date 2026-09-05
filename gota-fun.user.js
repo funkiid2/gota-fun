@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         gota fun v2
 // @namespace    http://tampermonkey.net/
-// @version      3.33.0
-// @description  v3.33.0: (1) gradiente de texto revertido al color brillante original (#3a1c71/#8a2be2/#d76d77) en los 4 lugares donde se había oscurecido. (2) opacidad de fondo de los 3 paneles (Perfil/Build/Servidores) subida de 0.32 a 0.88 -- a esa transparencia tan baja se filtraba el gris de fondo del sitio y el panel se veía apagado; los tres siguen parejos entre sí, solo cambió el nivel que comparten.
+// @version      3.37.0
+// @description  v3.37.0: dos mejoras más de rendimiento. (1) _updateInGameState (v3.35.0) leía el.offsetParent en CADA tick del beautifier -- offsetParent fuerza un layout síncrono si hay algo invalidado pendiente, y eso corría igual cada 400-900ms en pleno juego sin que nada relacionado hubiera cambiado en casi todos esos ticks. Se saca del polling: ahora un MutationObserver puntual sobre 'style'/'class' de los 2 paneles del menú dispara _updateInGameState SOLO cuando de verdad cambian, nunca por temporizador. (2) #leaderboard-panel y el panel de Servidores (:has(> .server-table)) -- actualizan contenido seguido en partida (rankings, cupo de jugadores) pero no tenían ningún "contain" -- suman "contain: layout style" (sin "paint", tienen box-shadow/backdrop-filter propio que "paint" recortaría).
 // @author       funkiid
+// @updateURL    https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
+// @downloadURL  https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
 // @icon         https://cdn.shopify.com/s/files/1/0125/8261/7145/files/BOYFRIEND_PLUSH_TOY-SV4-P-1_1000x.png.webp?v=1726159538
 // @match        https://gota.io/web/*
 // @match        https://play.gota.io/*
@@ -17,54 +19,19 @@
 (function () {
 'use strict';
 
-// ── ÍNDICE DE SECCIONES ─────────────────────────────────────────────────────
-//  0. Flags / constantes de configuración
-//  1. Referencias nativas capturadas ANTES de cualquier parche
-//  2. Diagnóstico de freezes (solo si DEBUG_FREEZE_LOG)
-//  3. Lockdown de console + supresión de errores del juego + mocks de APIs
-//  4. Patch de addEventListener (passive por defecto en eventos de scroll)
-//  5. Cola de beautify (declaración temprana, la usa la sección de red)
-//  6. Bloqueo de analytics/ads: setters de src/href, fetch, XHR, Worker,
-//     sendBeacon, WebSocket, cookies, storage, indexedDB, scheduler.postTask
-//  7. Pipeline de mutaciones del DOM (_processMuts vía requestIdleCallback)
-//  8. Mantenimiento periódico de buffers de performance + wipe de storage
-//  9. Audio keep-alive (evita throttling de pestaña en background)
-// 10. WebSocket (constructor parcheado) + preconnect dinámico
-// 11. ResizeObserver / IntersectionObserver batcheados en rAF/microtask
-// 12. Canvas: getContext endurecido + promoción de canvas + foco
-// 13. Spoof de document.hidden/visibilityState + wake lock
-// 14. Foco de campos de texto + prevención de context-menu/select/drag
-// 15. Teclas de juego (preventDefault fuera de campos de texto)
-// 16. Battery API spoof + document.title batcheado + navigator.locks
-// 17. Inyección de estilos (sagrado + perf) + resource hints de fuentes
-// 18. Loader de conexión
-// 19. Ad nuker (barrido de respaldo en DOMContentLoaded)
-// 20. UI beautifier (observers por-nodo con poda, scan por idle callback)
-// 21. Introspección de versión (window.__GOTA_FUN__)
-// ─────────────────────────────────────────────────────────────────────────
-
-// ── 0. FLAGS / CONSTANTES ───────────────────────────────────────────────────
-const SCRIPT_VERSION = '3.33.0'; // mantené esto sincronizado con @version de arriba
-
+const SCRIPT_VERSION = '3.37.0';
 const DEBUG_FREEZE_LOG = false;
-
-// Toggles experimentales, desactivados a propósito — quedan documentados acá
-// en vez de borrados por si en una sesión futura hace falta retomarlos con
-// medición real antes de prender cualquiera de los dos.
 const RETINA_PERF_MODE = false;
 if (RETINA_PERF_MODE) {
     try { Object.defineProperty(window, 'devicePixelRatio', { get: () => 1, configurable: true }); } catch (_) {}
 }
 const LOW_LATENCY_CANVAS_WEBGL = false;
 const LOW_LATENCY_CANVAS_2D    = false;
-
 const NET_TIMEOUT_MS = 8000;
-
 const W = window, D = document;
 const RL = D.head || D.documentElement;
 const NOP = () => {};
 
-// ── 1. REFERENCIAS NATIVAS CAPTURADAS ANTES DE CUALQUIER PARCHE ─────────────
 const _pNow      = performance.now.bind(performance);
 const _rAF       = W.requestAnimationFrame.bind(W);
 const _oST_      = W.setTimeout;
@@ -152,7 +119,6 @@ W.__freezeSummary = function () {
 
 let _lastBPLog = 0, _lastIDLog = 0;
 
-// ── 2. DIAGNÓSTICO DE FREEZES (solo bajo DEBUG_FREEZE_LOG) ──────────────────
 if (DEBUG_FREEZE_LOG) {
     try {
         if (W.PressureObserver) {
@@ -242,7 +208,6 @@ if (DEBUG_FREEZE_LOG) {
 
 try { if (W.performance) W.performance.toJSON = function () { return {}; }; } catch (_) {}
 
-// ── 3. LOCKDOWN DE CONSOLE + SUPRESIÓN DE ERRORES + MOCKS DE APIs ───────────
 if (!DEBUG_FREEZE_LOG) {
     try {
         if (W.performance) {
@@ -361,7 +326,6 @@ try {
     }
 } catch (_) {}
 
-// ── 4. PATCH DE addEventListener (passive por defecto) ──────────────────────
 const OPT_PASSIVE_TRUE    = Object.freeze({ passive: true });
 const OPT_PASSIVE_CAPTURE = Object.freeze({ capture: true, passive: true });
 const OPT_ACTIVE_CAPTURE  = Object.freeze({ capture: true, passive: false });
@@ -413,7 +377,6 @@ const EMPTY = Object.freeze([]);
 
 let _sacredStyleEl = null, _perfStyleEl = null;
 
-// ── 5. COLA DE BEAUTIFY (declaración temprana; la usa la sección de red) ───
 let _beautifyQueue = new Set();
 const _queueBeautify = node => {
     if (!node || _beautifyQueue.has(D.body)) return;
@@ -424,11 +387,9 @@ const _queueBeautify = node => {
 let _mutBacklogDropped = false;
 
 if (!DEBUG_FREEZE_LOG) {
-    // ya cubierto arriba en la sección 3 con el lockdown por propiedad
 }
-try { if (W.console) { /* noop */ } } catch (_) {}
+try { if (W.console) { } } catch (_) {}
 
-// ── 6. BLOQUEO DE ANALYTICS/ADS ──────────────────────────────────────────────
 try {
     const _idbBlk = new Set(['amplitude','mixpanel','analytics','clarity','posthog','segment','hotjar','sentry','newrelic','datadog']);
     const _FAKE = Object.freeze({ result:null, error:null, readyState:'done', onsuccess:null, onerror:null, onupgradeneeded:null, onblocked:null, addEventListener:NOP, removeEventListener:NOP, dispatchEvent:()=>false });
@@ -593,7 +554,6 @@ const _sanitizeInput = el => {
     }
 };
 
-// ── 7. PIPELINE DE MUTACIONES DEL DOM ────────────────────────────────────────
 try {
     let _mutQueue = [];
     let _mutHead = 0;
@@ -606,15 +566,6 @@ try {
     const _MUT_BACKLOG_CAP       = 500;
     const _MUT_COMPACT_THRESHOLD = 200;
 
-    // v3.21.0 (reinstalado en v3.32.0 -- se había perdido en una
-    // reconstrucción del archivo): navigator.scheduling.isInputPending()
-    // (Chrome 87+) le pregunta al navegador "¿hay un evento de input ya
-    // encolado esperando a que el hilo principal se desocupe?" -- pensada
-    // específicamente para cortar un trabajo largo YA ante un click o tecla,
-    // en vez de esperar a que termine su chunk actual o a que
-    // deadline.timeRemaining() se agote. Ataca el input lag sin tocar el
-    // canvas (LOW_LATENCY_CANVAS_* siguen en false). Si el navegador no la
-    // soporta, el check no hace nada y el pipeline se comporta como antes.
     const _hasInputPendingAPI = !!(navigator.scheduling && typeof navigator.scheduling.isInputPending === 'function');
     const _isInputPending = _hasInputPendingAPI ? () => navigator.scheduling.isInputPending() : () => false;
 
@@ -638,9 +589,6 @@ try {
                 if (processedThisTick >= _MUT_MAX_PER_TICK) break outer;
                 if (++checkCounter >= _MUT_CHUNK_CHECK_EVERY) {
                     checkCounter = 0;
-                    // Corte por input pendiente: corre siempre, sin depender
-                    // de requestIdleCallback -- por eso va afuera del check
-                    // de timeRemaining(), que sí necesita un deadline real.
                     if (_isInputPending()) break outer;
                     if (_canCheckDeadline && deadline.timeRemaining() <= 1) break outer;
                 }
@@ -798,7 +746,6 @@ try {
     performance.getEntriesByName = () => EMPTY;
 } catch (_) {}
 
-// ── 8. MANTENIMIENTO PERIÓDICO ───────────────────────────────────────────────
 let _maintPend = false, _lastPerfMaint = 0, _lastStorageMaint = 0;
 const _schedMaint = () => {
     if (_maintPend) return;
@@ -829,7 +776,6 @@ const _schedMaint = () => {
 };
 _schedMaint();
 
-// ── 9. AUDIO KEEP-ALIVE ───────────────────────────────────────────────────
 let _audioCtx = null, _audioGestureOk = false;
 const _initAudio = () => {
     try {
@@ -873,7 +819,6 @@ const _requestStoragePersist = () => {
 let _cvDone = false, _cvFocusTs = 0, _gameCanvas = null, _lastWSOrigin = null;
 let _isNewServer = true;
 
-// ── 10. WEBSOCKET (constructor parcheado) ───────────────────────────────────
 function WebSocket(url, protos) {
     _isNewServer = true;
     try { _lastWSOrigin = new URL(url, location.href).origin.replace(/^wss?:/, 'https:'); _preconnectOrigin(_lastWSOrigin); } catch (_) {}
@@ -910,7 +855,6 @@ try {
     }, OPT_P);
 } catch (_) {}
 
-// ── 11. RESIZEOBSERVER / INTERSECTIONOBSERVER BATCHEADOS ───────────────────
 const _OrigRO = W.ResizeObserver;
 if (_OrigRO) {
     W.ResizeObserver = function (cb) {
@@ -934,7 +878,6 @@ if (_OrigIO) {
     W.IntersectionObserver.prototype = _OrigIO.prototype;
 }
 
-// ── 12. CANVAS: getContext endurecido + promoción + foco ────────────────────
 const _origGetCtx = HTMLCanvasElement.prototype.getContext;
 const _promoteCanvas = cv => {
     if (cv._apexPromoted) return;
@@ -1005,7 +948,6 @@ HTMLCanvasElement.prototype.getContext = function (type, attrs) {
 };
 D.addEventListener('DOMContentLoaded', () => { try { D.querySelectorAll('canvas').forEach(_promoteCanvas); } catch (_) {} }, OPT_O);
 
-// ── 12b. WEBGPU: forzar high-performance en el adapter ──────────────────────
 try {
     if (navigator.gpu && typeof navigator.gpu.requestAdapter === 'function') {
         const _origRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
@@ -1027,7 +969,6 @@ try {
 } catch (_) {}
 try { Document.prototype.hasFocus = function () { return true; }; } catch (_) {}
 
-// ── 13. SPOOF DE VISIBILIDAD + WAKE LOCK ────────────────────────────────────
 let _tabHidden = _getRealHidden(), _wakelock = null, _wakelockPending = false;
 const _acqWL = async () => {
     if (_wakelockPending || _wakelock || !navigator.wakeLock) return;
@@ -1070,7 +1011,6 @@ try {
     }, OPT_P);
 } catch (_) {}
 
-// ── 14. FOCO DE CAMPOS DE TEXTO + PREVENCIÓN DE CONTEXT-MENU/SELECT/DRAG ────
 let _inTextField = false;
 _aEL.call(W, 'focusin', e => {
     const target = e.target;
@@ -1090,7 +1030,6 @@ _aEL.call(W, 'selectstart', e => { if (!_inTextField) e.preventDefault(); }, OPT
 _aEL.call(W, 'contextmenu', e => { if (!_inTextField) { e.preventDefault(); e.stopPropagation(); } }, OPT_ACTIVE_CAPTURE);
 _aEL.call(W, 'dragstart',   e => { if (!_inTextField) { e.preventDefault(); e.stopPropagation(); } }, OPT_ACTIVE_CAPTURE);
 
-// ── 15. TECLAS DE JUEGO ─────────────────────────────────────────────────────
 const _ignoredCodes = new Set([
     'Space', 'Tab',
     'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
@@ -1105,7 +1044,6 @@ _aEL.call(W, 'keydown', e => {
         !e.ctrlKey && !e.altKey && !e.metaKey) e.preventDefault();
 }, OPT_ACTIVE_CAPTURE);
 
-// ── 16. BATTERY SPOOF + TITLE BATCHEADO + NAVIGATOR.LOCKS ───────────────────
 try { if (navigator.getBattery) navigator.getBattery = () => Promise.resolve({ charging:true, chargingTime:0, dischargingTime:Infinity, level:1.0, addEventListener:NOP, removeEventListener:NOP, dispatchEvent:()=>true }); } catch (_) {}
 try {
     const _td = Object.getOwnPropertyDescriptor(Document.prototype, 'title') || Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'title');
@@ -1131,7 +1069,6 @@ D.addEventListener('DOMContentLoaded', () => {
     } catch (_) {}
 }, OPT_O);
 
-// ── 17. INYECCIÓN DE ESTILOS ─────────────────────────────────────────────────
 const _injectStyles = () => {
     try {
         const head = D.head || D.documentElement;
@@ -1186,13 +1123,6 @@ const _injectStyles = () => {
             opacity: 0.65 !important;
         }
 
-        /* v3.33.0: revertido -- la transparencia (0.32) dejaba pasar tanto el
-           gris de fondo del sitio que el panel se veía apagado/sin cuerpo,
-           en vez de sólido y oscuro. Vuelve a 0.88 (más opaco incluso que el
-           0.82 de antes de la ronda de "hazlo transparente"), mismo valor en
-           .main-panel y en el panel de Servidores (:has(> .server-table),
-           más abajo) para que los tres paneles se sigan viendo parejos entre
-           sí -- eso no cambió, solo el nivel de opacidad que comparten. */
         #leaderboard-panel {
             font-family: 'Karla', sans-serif !important;
             background: rgba(8, 4, 18, 0.55) !important;
@@ -1337,13 +1267,6 @@ const _injectStyles = () => {
             transform: scale(0.96) !important;
             transition-duration: 0.08s !important;
         }
-        /* v3.33.0: revertido -- el gradiente oscurecido (#180a2e/#4a1670/
-           #6b2a38) de una vuelta anterior vuelve al original más saturado
-           (#3a1c71/#8a2be2/#d76d77). Mismo alcance de siempre: este lugar,
-           el nombre de usuario (.main-panel img + *, más abajo), el nombre
-           de cada servidor (.server-table td:first-child) y
-           .apex-portal-label (Servidores) -- todos con el mismo color para
-           que ninguno quede desparejo del resto. */
         .main-panel button,
         .main-panel .gota-btn {
             background-image: linear-gradient(90deg, #3a1c71, #8a2be2, #d76d77, #8a2be2, #3a1c71) !important;
@@ -1365,14 +1288,6 @@ const _injectStyles = () => {
             animation: nebulaMove 6s linear infinite !important;
             font-weight: 700 !important;
         }
-        /* v3.29.0: nueva animación "cero costo" -- respiración sutil del
-           avatar de perfil (scale 1 <-> 1.015, SOLO transform, compositor
-           puro). Se aplica a la <img> del avatar, un elemento DISTINTO del
-           que ya tiene la animación de entrada (.main-panel, apexMenuIn) a
-           propósito: si dos animaciones tocan "transform" en el MISMO
-           elemento, la última declarada gana y la otra se pisa por completo
-           -- separar el elemento evita ese conflicto sin tener que combinar
-           ambas animaciones en un solo @keyframes. */
         .main-panel img {
             animation: apexAvatarBreath 4s ease-in-out infinite !important;
         }
@@ -1385,11 +1300,6 @@ const _injectStyles = () => {
             background: rgba(10, 5, 20, 0.45) !important;
             border-radius: 6px !important;
         }
-        /* v3.33.0: mismo valor 0.88 que .main-panel más arriba, para que los
-           3 paneles se sigan viendo parejos entre sí. Este selector
-           (":has(> .server-table)") es el panel de Servidores completo, no
-           ".main-panel" -- por eso necesita su propio ajuste acá en vez de
-           heredar el de arriba. */
         :has(> .server-table) {
             background: rgba(8, 4, 18, 0.88) !important;
             border: 1px solid rgba(138, 43, 226, 0.35) !important;
@@ -1556,15 +1466,9 @@ const _injectStyles = () => {
             image-rendering: auto !important;
         }
 
-        /* v3.29.0: input lag -- "transform: translateZ(0)" es un hint clásico
-           de promoción de capa: le pide al navegador que le dé al canvas su
-           propia capa de composición en la GPU en vez de compartir la del
-           resto del documento, sin cambiar nada del contexto de renderizado
-           (no toca desynchronized ni ningún atributo de getContext). Es
-           ortogonal a LOW_LATENCY_CANVAS_2D/WEBGL (que siguen en false) --
-           esto no tiene el trade-off de tearing que tiene desynchronized. */
         canvas {
             transform: translateZ(0) !important;
+            will-change: transform !important;
         }
 
         .apex-timer-container, .apex-linesplit-fixed {
@@ -1573,6 +1477,48 @@ const _injectStyles = () => {
 
         .xp-meter > span {
             contain: paint !important;
+        }
+
+        #chat-container, #score-panel, #party-panel,
+        #minimap-panel, #minimap, .minimap, #mini-map, .mini-map,
+        [id*="minimap" i], [class*="minimap" i] {
+            contain: content !important;
+        }
+        .main-panel img + *, .server-table td:first-child {
+            contain: paint !important;
+        }
+
+        /* v3.37.0: #leaderboard-panel y el panel de Servidores
+           (:has(> .server-table)) actualizan su contenido seguido durante
+           una partida (rankings, cantidad de jugadores) pero no tenían
+           ningún "contain" -- a diferencia de .main-panel, que sí lo tiene
+           desde el principio. Se usa "layout style" (SIN "paint") porque
+           los dos tienen box-shadow/backdrop-filter propio -- "paint"
+           recortaría esa sombra a los límites exactos de la caja, cambiando
+           cómo se ven (mismo motivo por el que .apex-timer-container/
+           .apex-linesplit-fixed, más abajo, tampoco usan "paint"). */
+        #leaderboard-panel, :has(> .server-table) {
+            contain: layout style !important;
+        }
+
+        /* v3.35.0: pausa las animaciones "infinite" que viven DENTRO de los
+           paneles del menú principal en cuanto _updateInGameState detecta
+           que ese menú dejó de estar realmente visible (jugando en partida).
+           animation-play-state:paused congela el frame actual sin tocar
+           ningún color/posición -- en cuanto el menú vuelve a verse,
+           _updateInGameState saca la clase y las animaciones retoman solas
+           desde donde quedaron (con "infinite" no hay estado que perder).
+           No se pausa apexMenuIn (la entrada del panel, ya termina sola) ni
+           nada del loader de conexión (ese ya se autooculta por su cuenta). */
+        html.apex-in-game .xp-meter > span,
+        html.apex-in-game .xp-meter > span::before,
+        html.apex-in-game .apex-portal-label,
+        html.apex-in-game .main-panel img,
+        html.apex-in-game .main-panel button,
+        html.apex-in-game .main-panel .gota-btn,
+        html.apex-in-game .main-panel img + *,
+        html.apex-in-game .server-table td:first-child {
+            animation-play-state: paused !important;
         }
 
         #apex-bh-rotor {
@@ -1658,7 +1604,6 @@ const _injectStyles = () => {
 };
 _injectStyles();
 
-// ── 18. LOADER DE CONEXIÓN ───────────────────────────────────────────────────
 const _initLoader = () => {
     try {
         const loader = _origCE('div'); loader.id = 'apex-loader';
@@ -1744,7 +1689,6 @@ D.addEventListener('DOMContentLoaded', () => {
     _requestStoragePersist();
 }, OPT_O);
 
-// ── 19. AD NUKER (barrido de respaldo) ──────────────────────────────────────
 const _nukeAdPanels = () => {
     try {
         const adNodes = D.querySelectorAll(_AD_SEL);
@@ -1761,7 +1705,6 @@ const _nukeAdPanels = () => {
 };
 D.addEventListener('DOMContentLoaded', _nukeAdPanels, OPT_O);
 
-// ── 20. UI BEAUTIFIER ────────────────────────────────────────────────────────
 const _beautifyWatched = new Map();
 const _watchBeautifyNode = (node) => {
     if (_beautifyWatched.has(node)) return;
@@ -1806,6 +1749,14 @@ const _tryAssembleMenuLayout = () => {
     if (profileOldParent && profileOldParent !== buildParent && profileOldParent !== wrapper && profileOldParent.children.length === 0) {
         profileOldParent.style.setProperty('display', 'none', 'important');
     }
+
+    // v3.37.0: recién acá quedan los 2 refs definitivos -- se engancha el
+    // observer puntual de visibilidad (ver _watchMenuVisibility más abajo en
+    // el archivo, section 20) y se corre un chequeo inicial una sola vez,
+    // en vez de depender del primer tick del polling que ya no existe.
+    _watchMenuVisibility(_apexBuildPanel);
+    _watchMenuVisibility(_apexProfilePanel);
+    _updateInGameState();
 };
 
 let _apexOptionsBtn = null, _apexHotkeysBtn = null, _apexThemeBtn = null, _apexCellPanelBtn = null;
@@ -1830,6 +1781,48 @@ const _tryAssembleExtraGrid = () => {
             p.style.setProperty('display', 'none', 'important');
         }
     });
+};
+
+// v3.35.0: "¿el menú principal está realmente visible ahora?" -- offsetParent
+// vuelve null cuando el elemento (o cualquier ancestro) tiene display:none,
+// pero NO cuando solo tiene opacity:0 o visibility:hidden, por eso se suma el
+// chequeo de getComputedStyle acá al lado. _apexBuildPanel/_apexProfilePanel
+// ya existen como refs (ver _tryAssembleMenuLayout más arriba) -- se reusan,
+// no hace falta un querySelector nuevo cada vez.
+// v3.37.0: _updateInGameState (v3.35.0) leía el.offsetParent en CADA tick de
+// _scheduleBeautifyLoop -- offsetParent fuerza un layout síncrono si hay
+// algo invalidado pendiente (uno de los ejemplos de libro de "layout
+// thrashing" evitables), y eso corría igual cada 900ms en plena partida sin
+// que nada relacionado con estos 2 paneles hubiera cambiado en casi todos
+// esos ticks. Se saca del polling: ahora un MutationObserver puntual mira
+// 'style' y 'class' de _apexBuildPanel/_apexProfilePanel -- son los únicos
+// 2 atributos por los que este mismo panel podría pasar a oculto/visible.
+// _updateInGameState solo se ejecuta cuando ESE observer ve un cambio real
+// en cualquiera de los dos, nunca por temporizador -- costo cero el resto
+// del tiempo, en vez de un layout forzado cada 400-900ms sin importar si
+// hacía falta.
+const _isMenuPanelVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    if (el.offsetParent === null) return false;
+    const cs = getComputedStyle(el);
+    return cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
+};
+let _apexInGame = false;
+const _updateInGameState = () => {
+    if (!_apexBuildPanel && !_apexProfilePanel) return;
+    const menuVisible = _isMenuPanelVisible(_apexBuildPanel) || _isMenuPanelVisible(_apexProfilePanel);
+    const nowInGame = !menuVisible;
+    if (nowInGame !== _apexInGame) {
+        _apexInGame = nowInGame;
+        try { D.documentElement.classList.toggle('apex-in-game', _apexInGame); } catch (_) {}
+    }
+};
+const _watchMenuVisibility = (el) => {
+    if (!el) return;
+    try {
+        new MutationObserver(_updateInGameState)
+            .observe(el, { attributes: true, attributeFilter: ['style', 'class'] });
+    } catch (_) {}
 };
 
 const _beautifyProcessTextNode = (node) => {
@@ -2015,9 +2008,24 @@ const _scheduleBeautify = () => {
         _runner();
     }
 };
-setInterval(_scheduleBeautify, 400);
+// v3.36.0: antes esto era un setInterval fijo a 400ms sin importar el
+// estado del juego. En partida (menú fuera de vista, _apexInGame true) la
+// única razón real para que este tick siga corriendo es el timer/badge de
+// line-split (arrow_range/refresh) -- no hace falta revisarlo cada 400ms
+// para eso. Se pasa a un loop autoreprogramable con setTimeout que elige su
+// propio próximo delay según _apexInGame: 400ms en el menú (responsividad
+// de la UI al armar el layout), 900ms en partida (menos despertares del
+// hilo principal mientras el juego está corriendo, sin perder el refresco
+// del badge de line-split -- ese timer visual no necesita más frecuencia
+// que eso para verse fluido).
+const _BEAUTIFY_TICK_MENU_MS = 400;
+const _BEAUTIFY_TICK_GAME_MS = 900;
+const _scheduleBeautifyLoop = () => {
+    _scheduleBeautify();
+    _oST_(_scheduleBeautifyLoop, _apexInGame ? _BEAUTIFY_TICK_GAME_MS : _BEAUTIFY_TICK_MENU_MS);
+};
+_scheduleBeautifyLoop();
 
-// ── 21. INTROSPECCIÓN DE VERSIÓN ─────────────────────────────────────────────
 try {
     Object.defineProperty(W, '__GOTA_FUN__', {
         value: Object.freeze({
